@@ -25,7 +25,17 @@ probability-recursive encoder guides, module names and state_dict keys.
 The public defaults follow the saved experiment configuration: use_aux=False
 and detach_group_to_point=True. Set these explicitly for other experiments.
 PGSFMUnetFormer remains available as an alias for existing import statements.
-Only the model is included; training losses, datasets and weights are separate.
+Two variants are included:
+- FlockFormer (default, paper): probability-recursive guides; training returns
+  (group_logits, point_logits).
+- FlockFormerLogitGuide (optional, development): logit-recursive guides;
+  training returns (group_logits, point_logits, guide_logits).
+  Select explicitly with: model = FlockFormerLogitGuide().
+  return_dict=True includes guide_logits for optional hierarchical supervision.
+Both variants return group logits in eval mode. PGSFMUnetFormer selects the
+paper variant. Matching parameter shapes allow strict weight loading, while
+recursion changes affect predictions; use the variant used for training.
+Only models are included; training losses, datasets and weights are separate.
 
 Architecture lineage: UNetFormer-style global-local decoder, ResNet backbone
 provided by timm, and the project's point-guided resampling/fusion modules.
@@ -1111,6 +1121,160 @@ class FlockFormer(nn.Module):
 
 
 # =====================================================================================
+# =====================================================================================
+# Optional development variant. The paper model remains FlockFormer above.
+# Shared blocks and initialization are inherited without changing parameter names.
+# =====================================================================================
+
+class LogitGuidedResNetEncoder(PointGuidedResNetEncoder):
+    """Accumulate guidance logits; expose all four logits for optional supervision."""
+
+    def _combine_guide_logits(self, current_logit: torch.Tensor, prev_logit: Optional[torch.Tensor], size: Tuple[int, int]) -> torch.Tensor:
+        # Cascade in logit space so hierarchical prior supervision on deeper
+        # guides can back-propagate through shallower seeds as well.
+        if prev_logit is None:
+            return current_logit
+        prev = F.interpolate(prev_logit, size=size, mode='bilinear', align_corners=False)
+        return current_logit + prev
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, List[torch.Tensor], List[torch.Tensor]]:
+        x = self.backbone.conv1(x)
+        x = self.backbone.bn1(x)
+        if hasattr(self.backbone, "act1"):
+            x = self.backbone.act1(x)
+        else:
+            x = self.backbone.relu(x)
+        x = self.backbone.maxpool(x)
+
+        r1 = self.backbone.layer1(x)
+        l1 = self._combine_guide_logits(self.seed1(r1), None, r1.shape[-2:])
+        g1 = torch.sigmoid(l1)
+        res1 = self.ars1(r1, g1) if self.use_pgars else r1
+
+        r2 = self.backbone.layer2(res1)
+        l2 = self._combine_guide_logits(self.seed2(r2), l1, r2.shape[-2:])
+        g2 = torch.sigmoid(l2)
+        res2 = self.ars2(r2, g2) if self.use_pgars else r2
+
+        r3 = self.backbone.layer3(res2)
+        l3 = self._combine_guide_logits(self.seed3(r3), l2, r3.shape[-2:])
+        g3 = torch.sigmoid(l3)
+        res3 = self.ars3(r3, g3) if self.use_pgars else r3
+
+        res4 = self.backbone.layer4(res3)
+        l4 = self._combine_guide_logits(self.seed4(res4), l3, res4.shape[-2:])
+        g4 = torch.sigmoid(l4)
+
+        return res1, res2, res3, res4, [g1, g2, g3, g4], [l1, l2, l3, l4]
+
+
+class FlockFormerLogitGuide(nn.Module):
+    """
+    Development variant with logit-recursive encoder guidance.
+
+    Key logic:
+    1) The point branch supplies internal guidance for flock-region segmentation.
+    2) Sparse point evidence guides encoder resampling (PGARS) and decoder GLTB attention.
+    3) Final output is still group mask logits, refined by a learnable point-to-group envelope.
+    4) Encoder guide logits (hierarchical point-prior pyramid, strides 4/8/16/32) are exposed
+       during training so they can receive training-only prior supervision; inference is
+       unchanged and needs the image only.
+
+    Default inference output: group logits only.
+    Default training output: tuple(group_logits, point_logits, guide_logits[4])
+    Optional detailed output with internal tensors: return_dict=True
+    """
+
+    def __init__(
+        self,
+        in_channels: int = 4,
+        decode_channels: int = 64,
+        dropout: float = 0.1,
+        backbone_name: str = 'resnet18',
+        pretrained: bool = False,
+        window_size: int = 8,
+        num_classes: int = 2,
+        use_skip_fusion: bool = True,
+        use_sfm_up: bool = True,
+        use_pgars: bool = True,
+        use_aux: bool = False,
+        detach_group_to_point: bool = True,
+    ):
+        super().__init__()
+        self.use_skip_fusion = use_skip_fusion
+        self.num_classes = num_classes
+        self.use_aux = use_aux
+
+        self.encoder = LogitGuidedResNetEncoder(
+            backbone_name=backbone_name,
+            in_channels=in_channels,
+            pretrained=pretrained,
+            use_pgars=use_pgars,
+        )
+        encoder_channels = tuple(self.encoder.channels)
+
+        if use_skip_fusion:
+            c1, c2, c3, c4 = encoder_channels
+            self.merge12 = WeightedMergeBlock(c_hi=c1, c_lo=c2, out_ch=c1, per_channel=True)
+            self.merge23 = WeightedMergeBlock(c_hi=c2, c_lo=c3, out_ch=c2, per_channel=True)
+            self.merge34 = WeightedMergeBlock(c_hi=c3, c_lo=c4, out_ch=c3, per_channel=True)
+
+        self.decoder = PGSFMDecoder(
+            encoder_channels=encoder_channels,
+            decode_channels=decode_channels,
+            dropout=dropout,
+            window_size=window_size,
+            num_classes=num_classes,
+            use_sfm_up=use_sfm_up,
+            use_aux=use_aux,
+            detach_group_to_point=detach_group_to_point,
+        )
+
+    def _foreground_prob(self, seg_logits: torch.Tensor) -> torch.Tensor:
+        if self.num_classes == 1:
+            return torch.sigmoid(seg_logits)
+        return torch.softmax(seg_logits, dim=1)[:, 1:2]
+
+    @torch.no_grad()
+    def predict_group_prob(self, x: torch.Tensor) -> torch.Tensor:
+        was_training = self.training
+        self.eval()
+        logits = self.forward(x)
+        prob = self._foreground_prob(logits)
+        if was_training:
+            self.train()
+        return prob
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        return_dict: bool = False,
+        return_point: bool = False,
+        return_debug: bool = False,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor, List[torch.Tensor]], Dict[str, torch.Tensor]]:
+        h, w = x.size()[-2:]
+        res1, res2, res3, res4, enc_guides, enc_guide_logits = self.encoder(x)
+
+        if self.use_skip_fusion:
+            r1, r2, r3, r4 = res1, res2, res3, res4
+            res3 = self.merge34(r3, r4)
+            res2 = self.merge23(r2, r3)
+            res1 = self.merge12(r1, r2)
+
+        outputs = self.decoder(res1, res2, res3, res4, enc_guides, h, w, return_debug=return_debug)
+        outputs["guide_logits"] = enc_guide_logits
+
+        if return_dict:
+            if return_debug:
+                outputs["encoder_guides"] = [g.detach() for g in enc_guides]
+            return outputs
+
+        if self.training or return_point:
+            return outputs["group_logits"], outputs["point_logits"], enc_guide_logits
+
+        return outputs["group_logits"]
+
+
 # Backward-compatible import name; parameter names remain unchanged.
 PGSFMUnetFormer = FlockFormer
 
@@ -1138,3 +1302,4 @@ def _smoke_test() -> None:
 
 if __name__ == "__main__":
     _smoke_test()
+
